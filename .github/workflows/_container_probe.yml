@@ -1,0 +1,89 @@
+# racecar CONTAINER PROBE -- not a measured target.
+#
+# Question: can a `jobs.<id>.container` job be instrumented at all? It governs
+# ~147 jobs across ~41 repos, and no other single run generalises that far.
+#
+# The image is deliberately GENERIC. A project-specific image would confound
+# "container: is broken" with "this image lacks something" -- the exact ambiguity
+# the probe exists to remove. debian:13 provably satisfies the documented
+# bash + glibc requirement and still ships no runc, so either outcome is
+# unambiguous. An already-scheduled run would be corroboration, not the
+# experiment.
+#
+# Read PER ARM:
+#   instrumented fails at the ASSERT, baseline green  -> container blocks instrumentation
+#   both green                                        -> containers ARE instrumented;
+#                                                        the earlier failure was image-specific
+#   both fail in the BUILD                            -> says nothing about containers
+name: container-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: baseline (uninstrumented) or instrumented (under chalk/curiosity)
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: CrashOverride chalk profile
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
+
+run-name: "container-probe ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    container: debian:13
+    steps:
+      # UNGATED and identical on both arms: an asymmetric setup cost between arms
+      # would bias exactly the comparison this probe is for.
+      - name: Install curl/bash for action-checkout (racecar; ungated, both arms)
+        shell: sh
+        run: |
+          command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1 && exit 0
+          apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates bash
+
+      - name: Record the container's own facts (ungated, both arms)
+        shell: sh
+        run: |
+          echo "image:  $(cat /etc/os-release | grep PRETTY_NAME || true)"
+          echo "libc:   $(ldd --version 2>&1 | head -1)"
+          echo "bash:   $(command -v bash || echo ABSENT)"
+          echo "curl:   $(command -v curl || echo ABSENT)"
+          echo "runc:   $(command -v runc || echo ABSENT)"
+          echo "docker: $(command -v docker || echo ABSENT)"
+
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
+      # Real compiler work, so a green run means something was actually observed.
+      - name: Build something real
+        run: |
+          apt-get install -y -qq gcc
+          printf 'int main(void){return 0;}\n' > /tmp/p.c
+          gcc -O2 -o /tmp/p /tmp/p.c
+          /tmp/p && echo "compiled and ran"
